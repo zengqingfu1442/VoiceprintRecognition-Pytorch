@@ -250,9 +250,9 @@ class MVectorPredictor:
         # 加载音频文件，并进行预处理
         input_data = self._load_audio(audio_data=audio_data, sample_rate=sample_rate)
         input_data = torch.tensor(input_data.samples, dtype=torch.float32).unsqueeze(0)
-        audio_feature = self._audio_featurizer(input_data).to(self.device)
-        # 执行预测
-        feature = self.predictor(audio_feature).data.cpu().numpy()[0]
+        with torch.inference_mode():
+            audio_feature = self._audio_featurizer(input_data).to(self.device)
+            feature = self.predictor(audio_feature).cpu().numpy()[0]
         return feature
 
     def predict_batch(self, audios_data, sample_rate=16000, batch_size=32):
@@ -260,6 +260,7 @@ class MVectorPredictor:
 
         :param audios_data: 需要识别的数据，支持文件路径，文件对象，字节，numpy，AudioSegment对象。如果是字节的话，必须是完整并带格式的字节文件
         :param sample_rate: 如果传入的事numpy数据，需要指定采样率
+        :param batch_size: 推理批大小，特征提取和模型都按该大小分批，避免长音频一次性占满内存
         :return: 声纹特征向量
         """
         audios_data1 = []
@@ -267,29 +268,79 @@ class MVectorPredictor:
             # 加载音频文件，并进行预处理
             input_data = self._load_audio(audio_data=audio_data, sample_rate=sample_rate)
             audios_data1.append(input_data.samples)
-        # 找出音频长度最长的
-        batch = sorted(audios_data1, key=lambda a: a.shape[0], reverse=True)
-        max_audio_length = batch[0].shape[0]
-        input_size = len(batch)
-        # 以最大的长度创建0张量
-        inputs = np.zeros((input_size, max_audio_length), dtype=np.float32)
-        input_lens_ratio = []
-        for x in range(input_size):
-            tensor = audios_data1[x]
+        return self._extract_features_batch(audios_data1, batch_size=batch_size)
+
+    def _forward_samples(self, batch_samples):
+        """对一批已处理好的音频样本做一次前向推理"""
+        max_audio_length = max(a.shape[0] for a in batch_samples)
+        inputs = np.zeros((len(batch_samples), max_audio_length), dtype=np.float32)
+        input_lens_ratio = np.empty(len(batch_samples), dtype=np.float32)
+        for j, tensor in enumerate(batch_samples):
             seq_length = tensor.shape[0]
-            # 将数据插入都0张量中，实现了padding
-            inputs[x, :seq_length] = tensor[:]
-            input_lens_ratio.append(seq_length / max_audio_length)
-        inputs = torch.tensor(inputs, dtype=torch.float32)
-        input_lens_ratio = torch.tensor(input_lens_ratio, dtype=torch.float32)
-        audio_feature = self._audio_featurizer(inputs, input_lens_ratio).to(self.device)
-        # 执行预测
+            inputs[j, :seq_length] = tensor
+            input_lens_ratio[j] = seq_length / max_audio_length
+        with torch.inference_mode():
+            inputs = torch.from_numpy(inputs)
+            input_lens_ratio = torch.from_numpy(input_lens_ratio)
+            audio_feature = self._audio_featurizer(inputs, input_lens_ratio).to(self.device)
+            feature = self.predictor(audio_feature).cpu().numpy()
+        return feature
+
+    def _extract_features_batch(self, samples_list, batch_size=32):
+        """从已处理好的音频样本批量提取声纹特征，按批推理并在显存不足时自动降批。"""
+        if len(samples_list) == 0:
+            return np.empty((0, 0), dtype=np.float32)
         features = []
-        for i in range(0, input_size, batch_size):
-            feature = self.predictor(audio_feature[i:i + batch_size]).data.cpu().numpy()
-            features.extend(feature)
-        features = np.array(features)
-        return features
+        i = 0
+        cur_bs = max(int(batch_size), 1)
+        n = len(samples_list)
+        while i < n:
+            try:
+                features.append(self._forward_samples(samples_list[i:i + cur_bs]))
+                i += cur_bs
+            except RuntimeError as e:
+                if self.device.type != 'cuda' or 'out of memory' not in str(e).lower() or cur_bs <= 1:
+                    raise
+                torch.cuda.empty_cache()
+                cur_bs = max(1, cur_bs // 2)
+                logger.warning(f'显存不足，降低batch_size为{cur_bs}后重试')
+        return np.concatenate(features, axis=0)
+
+    def _diarize_from_chunk_iter(self, chunk_iter, speaker_num=None, search_audio_db=False, batch_size=32):
+        """从切分后的音频片段迭代器完成特征提取、聚类和可选的声纹库检索。"""
+        segments = []
+        samples_batch = []
+        feature_chunks = []
+        # 片段已在整段音频上完成重采样和音量归一化，直接提取特征，避免再次走加载流程
+        for st, ed, chunk in tqdm(chunk_iter, desc='提取说话人特征', unit='seg'):
+            segments.append([st, ed])
+            samples_batch.append(chunk)
+            if len(samples_batch) >= batch_size:
+                feature_chunks.append(self._extract_features_batch(samples_batch, batch_size=batch_size))
+                samples_batch = []
+        if samples_batch:
+            feature_chunks.append(self._extract_features_batch(samples_batch, batch_size=batch_size))
+        if not feature_chunks:
+            logger.warning('未切分出有效语音片段')
+            return []
+        features = np.concatenate(feature_chunks, axis=0)
+        logger.info(f'共提取 {len(segments)} 个片段特征，开始聚类...')
+        labels, spk_center_embeddings = self.speaker_diarize.clustering(features, speaker_num=speaker_num)
+        outputs = self.speaker_diarize.postprocess(segments, labels)
+        if search_audio_db:
+            assert self.audio_feature is not None, "数据库中没有音频数据，请先指定说话人特征数据库或者注册说话人"
+            names = self.__retrieval(np_feature=spk_center_embeddings)
+            results = []
+            for output in outputs:
+                name = names[output['speaker']][0]
+                result = {
+                    'speaker': name if name else f"陌生人{output['speaker']}",
+                    'start': output['start'],
+                    'end': output['end']
+                }
+                results.append(result)
+            outputs = results
+        return outputs
 
     def contrast(self, audio_data1, audio_data2):
         """声纹对比
@@ -401,7 +452,8 @@ class MVectorPredictor:
         else:
             return False
 
-    def speaker_diarization(self, audio_data, sample_rate=16000, speaker_num=None, search_audio_db=False):
+    def speaker_diarization(self, audio_data, sample_rate=16000, speaker_num=None, search_audio_db=False,
+                            batch_size=32):
         """说话人日志识别
 
         Args:
@@ -409,27 +461,36 @@ class MVectorPredictor:
             sample_rate (int): 如果传入的是numpy数据，需要指定采样率
             speaker_num (int): 预期的说话人数量，提供说话人数量可以提高准确率
             search_audio_db (bool): 是否在数据库中搜索与输入音频最匹配的音频进行识别
+            batch_size (int): 特征提取批大小。长音频会按该大小分批推理，避免一次性占用过多内存/显存
         Returns:
             list: 说话人日志识别结果
         """
         input_data = self._load_audio(audio_data=audio_data, sample_rate=sample_rate)
-        segments = self.speaker_diarize.segments_audio(input_data)
-        segments_data = [segment[2] for segment in segments]
-        features = self.predict_batch(segments_data, sample_rate=sample_rate)
-        labels, spk_center_embeddings = self.speaker_diarize.clustering(features, speaker_num=speaker_num)
-        outputs = self.speaker_diarize.postprocess(segments, labels)
-        if search_audio_db:
-            assert self.audio_feature is not None, "数据库中没有音频数据，请先指定说话人特征数据库或者注册说话人"
-            names = self.__retrieval(np_feature=spk_center_embeddings)
-            results = []
-            for output in outputs:
-                name = names[output['speaker']][0]
-                result = {
-                    'speaker': name if name else f"陌生人{output['speaker']}",
-                    'start': output['start'],
-                    'end': output['end']
-                }
-                results.append(result)
-            outputs = results
-        return outputs
+        logger.info(f'开始说话人日志识别，音频时长: {input_data.duration:.2f}s')
+        return self._diarize_from_chunk_iter(self.speaker_diarize.iter_segments(input_data),
+                                            speaker_num=speaker_num,
+                                            search_audio_db=search_audio_db,
+                                            batch_size=batch_size)
+
+    def speaker_diarization_from_timestamps(self, audio_data, timestamps, sample_rate=16000, speaker_num=None,
+                                            search_audio_db=False, batch_size=32):
+        """根据给定声音片段时间戳进行说话人日志识别，不使用VAD。
+
+        Args:
+            audio_data: 需要识别的数据，支持文件路径，文件对象，字节，numpy。如果是字节的话，必须是完整并带格式的字节文件
+            timestamps: 声音片段时间戳，单位为秒。支持 ``[{'start': 0.1, 'end': 1.2}, ...]`` 或 ``[[0.1, 1.2], ...]``
+            sample_rate (int): 如果传入的是numpy数据，需要指定采样率
+            speaker_num (int): 预期的说话人数量，提供说话人数量可以提高准确率
+            search_audio_db (bool): 是否在数据库中搜索与输入音频最匹配的音频进行识别
+            batch_size (int): 特征提取批大小。长音频会按该大小分批推理，避免一次性占用过多内存/显存
+        Returns:
+            list: 说话人日志识别结果
+        """
+        input_data = self._load_audio(audio_data=audio_data, sample_rate=sample_rate)
+        logger.info(f'开始基于时间戳的说话人日志识别，音频时长: {input_data.duration:.2f}s')
+        chunk_iter = self.speaker_diarize.iter_segments_from_timestamps(input_data, timestamps)
+        return self._diarize_from_chunk_iter(chunk_iter,
+                                            speaker_num=speaker_num,
+                                            search_audio_db=search_audio_db,
+                                            batch_size=batch_size)
 

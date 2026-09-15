@@ -80,22 +80,40 @@ class SpeakerDiarizationGUI:
             self.plot_speaker.plot.close()
         self.plot_speaker = None
         audio_path = self.entry_audio1.get()
-        if audio_path is None or len(audio_path) == 0: return
+        if audio_path is None or len(audio_path) == 0:
+            return
         print(f'选择音频路径：{audio_path}')
-        # 进行说话人日志识别
-        results = self.predictor.speaker_diarization(audio_path,
-                                                     speaker_num=args.speaker_num,
-                                                     search_audio_db=self.search_audio_db)
+        self.btn_predict.config(state=tk.DISABLED)
         self.result_text.delete('1.0', 'end')
+        self.result_text.insert(tk.END, '正在识别，请稍候...\n')
+        search_audio_db = self.search_audio_db
+        threading.Thread(target=self._run_predict, args=(audio_path, search_audio_db), daemon=True).start()
+
+    def _run_predict(self, audio_path, search_audio_db):
+        error = None
+        results = None
+        try:
+            results = self.predictor.speaker_diarization(audio_path,
+                                                         speaker_num=args.speaker_num,
+                                                         search_audio_db=search_audio_db)
+        except Exception as e:
+            error = e
+        self.window.after(0, self._on_predict_done, results, error)
+
+    def _on_predict_done(self, results, error):
+        self.btn_predict.config(state=tk.NORMAL)
+        self.result_text.delete('1.0', 'end')
+        if error is not None:
+            self.result_text.insert(tk.END, f'识别失败：{error}\n')
+            return
         for result in results:
             self.result_text.insert(tk.END, f"{result}\n")
-
         if self.show_plot:
-            threading.Thread(target=self.show_result(results), args=(results,)).start()
+            self.show_result(results)
 
     def show_result(self, results):
         from mvector.infer_utils.viewer import PlotSpeaker
-        self.plot_speaker = PlotSpeaker(results, audio_path=args.audio_path)
+        self.plot_speaker = PlotSpeaker(results, audio_path=self.entry_audio1.get() or args.audio_path)
         os.makedirs('output', exist_ok=True)
         self.plot_speaker.draw('output/speaker_diarization.png')
         self.plot_speaker.plot.show()
